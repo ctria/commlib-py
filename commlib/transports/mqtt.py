@@ -5,7 +5,7 @@ MQTT Implementation
 import functools
 import time
 from enum import IntEnum
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, Callable
 
 import paho.mqtt.client as mqtt
 
@@ -19,8 +19,9 @@ from commlib.logger import Logger
 from commlib.msg import PubSubMessage, RPCMessage
 from commlib.pubsub import BasePublisher, BaseSubscriber
 from commlib.rpc import BaseRPCClient, BaseRPCServer, BaseRPCService
-from commlib.serializer import Serializer, JSONSerializer
+from commlib.serializer import JSONSerializer, Serializer
 from commlib.utils import gen_timestamp
+from commlib.compression import CompressionType, inflate_str, deflate
 
 
 class MQTTReturnCode(IntEnum):
@@ -75,21 +76,26 @@ class MQTTTransport:
     def __init__(self,
                  conn_params: ConnectionParameters = ConnectionParameters(),
                  serializer: Serializer = JSONSerializer(),
+                 compression: CompressionType = CompressionType.DEFAULT_COMPRESSION,
                  logger: Logger = None):
         """__init__.
 
         Args:
             conn_params (ConnectionParameters): conn_params
+            serializer (Serializer): serializer
+            compression (bool): compression
+            compression_type (CompressionType): compression_type
             logger (Logger): logger
         """
         self._conn_params = conn_params
         self._logger = logger
-        self._connected = False
-
         self._serializer = serializer
+        self._compression= compression
 
         self.logger = Logger(self.__class__.__name__) if \
             logger is None else logger
+
+        self._connected = False
 
         self._client = mqtt.Client(clean_session=True,
                                    protocol=mqtt.MQTTv311,
@@ -106,6 +112,13 @@ class MQTTTransport:
         self._client.connect(self._conn_params.host,
                              int(self._conn_params.port),
                              60)
+        self.logger.debug('MQTT Transport initiated:')
+        self.logger.debug(
+            f'- Broker: mqtt://' + \
+            f'{self._conn_params.host}:{self._conn_params.port}'
+        )
+        self.logger.debug(f'- Data Serialization: {self._serializer}')
+        self.logger.debug(f'- Data Compression: {self._compression}')
 
     @property
     def is_connected(self):
@@ -125,7 +138,8 @@ class MQTTTransport:
         """
         if rc == MQTTReturnCode.CONNECTION_SUCCESS:
             self.logger.debug(
-                f"Connected to MQTT broker <{self._conn_params.host}:{self._conn_params.port}>")
+                f'Connected to MQTT broker <mqtt://' + \
+                f'{self._conn_params.host}:{self._conn_params.port}>')
             self._connected = True
 
     def on_disconnect(self, client: Any, userdata: Any,
@@ -142,8 +156,7 @@ class MQTTTransport:
         if rc != 0:
             self.logger.warn("Unexpected disconnection from MQTT Broker.")
 
-    def on_message(self, client: Any, userdata: Any,
-                   msg: Dict[str, Any]):
+    def on_message(self, client: Any, userdata: Any, msg: Dict[str, Any]):
         """on_message.
 
         Callback for on-message event.
@@ -174,6 +187,8 @@ class MQTTTransport:
         """
         topic = topic.replace('.', '/')
         pl = self._serializer.serialize(payload)
+        if self._compression != CompressionType.NO_COMPRESSION:
+            pl = inflate_str(pl)
         ph = self._client.publish(topic, pl, qos=qos, retain=retain)
         if confirm_delivery:
             ph.wait_for_publish()
@@ -192,8 +207,20 @@ class MQTTTransport:
         ## Adds subtopic specific callback handlers
         topic = topic.replace('.', '/').replace('*', '#')
         self._client.subscribe(topic, qos)
-        self._client.message_callback_add(topic, callback)
+        _clb = functools.partial(self._on_msg_internal, callback)
+        self._client.message_callback_add(topic, _clb)
         return topic
+
+    def _on_msg_internal(self, callback: Callable, client: Any,
+                         userdata: Any, msg: Any):
+        _topic = msg.topic
+        _payload = msg.payload
+        _qos = msg.qos
+        _retain = msg.retain
+        if self._compression != CompressionType.NO_COMPRESSION:
+            _payload = deflate(_payload)
+        msg.payload = _payload
+        callback(client, userdata, msg)
 
     def start_loop(self):
         """start_loop.
@@ -237,6 +264,7 @@ class Publisher(BasePublisher):
         super().__init__(*args, **kwargs)
         self._transport = MQTTTransport(conn_params=conn_params,
                                         serializer=self._serializer,
+                                        compression=self._compression,
                                         logger=self._logger)
         self._transport.start_loop()
 
@@ -306,6 +334,7 @@ class Subscriber(BaseSubscriber):
         super(Subscriber, self).__init__(*args, **kwargs)
         self._transport = MQTTTransport(conn_params=conn_params,
                                         serializer=self._serializer,
+                                        compression=self._compression,
                                         logger=self._logger)
 
     def run(self):
@@ -394,6 +423,7 @@ class RPCService(BaseRPCService):
         super(RPCService, self).__init__(*args, **kwargs)
         self._transport = MQTTTransport(conn_params=conn_params,
                                         serializer=self._serializer,
+                                        compression=self._compression,
                                         logger=self._logger)
 
     def _send_response(self, data: dict, reply_to: str):
@@ -486,6 +516,7 @@ class RPCServer(BaseRPCServer):
         super(RPCServer, self).__init__(*args, **kwargs)
         self._transport = MQTTTransport(conn_params=conn_params,
                                         serializer=self._serializer,
+                                        compression=self._compression,
                                         logger=self._logger)
         for uri in self._svc_map:
             callback = self._svc_map[uri][0]
@@ -598,6 +629,7 @@ class RPCClient(BaseRPCClient):
         super(RPCClient, self).__init__(*args, **kwargs)
         self._transport = MQTTTransport(conn_params=conn_params,
                                         serializer=self._serializer,
+                                        compression=self._compression,
                                         logger=self._logger)
         self._transport.start_loop()
 

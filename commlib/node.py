@@ -108,7 +108,7 @@ class HeartbeatThread(threading.Thread):
             msg = HeartbeatMessage(ts=self.get_ts())
             while not self._stop_event.isSet():
                 self.logger.info(
-                    f'Sending heartbeat message - {self._heartbeat_pub._topic}')
+                    f'Sending heartbeat message <{self._heartbeat_pub._topic}>')
                 if self._heartbeat_pub._msg_type == None:
                     self._heartbeat_pub.publish(msg.as_dict())
                 else:
