@@ -10,11 +10,11 @@ from typing import Dict
 
 import pika
 
-from commlib.action import (
-    BaseActionClient, BaseActionService, _ActionCancelMessage,
-    _ActionFeedbackMessage, _ActionGoalMessage,
-    _ActionResultMessage, _ActionStatusMessage
-)
+from commlib.action import (BaseActionClient, BaseActionService,
+                            _ActionCancelMessage, _ActionFeedbackMessage,
+                            _ActionGoalMessage, _ActionResultMessage,
+                            _ActionStatusMessage)
+from commlib.compression import CompressionType, deflate, inflate_str
 from commlib.events import BaseEventEmitter, Event
 from commlib.exceptions import *
 from commlib.logger import Logger
@@ -314,10 +314,10 @@ class AMQPTransport:
             self._channel = self._connection.channel()
             # self.add_threadsafe_callback(self._on_connect)
             self.logger.debug(
-                    'Connected to AMQP broker @ [{}:{}, vhost={}]'.format(
-                        self._conn_params.host,
-                        self._conn_params.port,
-                        self._conn_params.vhost))
+                f'Connected to AMQP broker <amqp://' + \
+                f'{self._conn_params.host}:{self._conn_params.port}, ' + \
+                f'vhost={self._conn_params.vhost}>'
+            )
         except pika.exceptions.ConnectionClosed:
             self.logger.debug('Connection timed out. Reconnecting...')
             self.connect()
@@ -505,9 +505,6 @@ class AMQPTransport:
     def disconnect(self):
         self._graceful_shutdown()
 
-    # def __del__(self):
-    #     self._graceful_shutdown()
-
 
 class RPCService(BaseRPCService):
     """AMQP RPC Service class.
@@ -584,6 +581,8 @@ class RPCService(BaseRPCService):
             self.logger.error("Exception Thrown in on_request_handle",
                               exc_info=True)
         try:
+            if self._compression != CompressionType.NO_COMPRESSION:
+                body = deflate(body)
             _data = self._serializer.deserialize(body)
         except Exception:
             self.logger.error("Could not deserialize data", exc_info=True)
@@ -619,7 +618,11 @@ class RPCService(BaseRPCService):
         try:
             _encoding = self._serializer.CONTENT_ENCODING
             _type = self._serializer.CONTENT_TYPE
-            _payload = self._serializer.serialize(data).encode(_encoding)
+            _payload = self._serializer.serialize(data)
+            if self._compression != CompressionType.NO_COMPRESSION:
+                _payload = inflate_str(_payload)
+            else:
+                _payload = _payload.encode(_encoding)
         except Exception as e:
             self.logger.error("Could not deserialize data",
                               exc_info=True)
@@ -795,6 +798,8 @@ class RPCClient(BaseRPCClient):
                               exc_info=True)
 
         try:
+            if self._compression != CompressionType.NO_COMPRESSION:
+                body = deflate(body)
             _data = self._serializer.deserialize(body)
         except Exception:
             self.logger.error("Could not deserialize data",
@@ -802,14 +807,18 @@ class RPCClient(BaseRPCClient):
             _data = {}
         self._response = _data
 
-    def _send_msg(self, data: dict) -> None:
+    def _send_msg(self, data: Dict) -> None:
         _payload = None
         _encoding = None
         _type = None
 
         _encoding = self._serializer.CONTENT_ENCODING
         _type = self._serializer.CONTENT_TYPE
-        _payload = self._serializer.serialize(data).encode(_encoding)
+        _payload = self._serializer.serialize(data)
+        if self._compression != CompressionType.NO_COMPRESSION:
+            _payload = inflate_str(_payload)
+        else:
+            _payload = _payload.encode(_encoding)
 
         # Direct reply-to implementation
         _rpc_props = MessageProperties(
@@ -886,7 +895,11 @@ class Publisher(BasePublisher):
 
         _encoding = self._serializer.CONTENT_ENCODING
         _type = self._serializer.CONTENT_TYPE
-        _payload = self._serializer.serialize(msg).encode(_encoding)
+        _payload = self._serializer.serialize(msg)
+        if self._compression != CompressionType.NO_COMPRESSION:
+            _payload = inflate_str(_payload)
+        else:
+            _payload = _payload.encode(_encoding)
 
         msg_props = MessageProperties(
             content_type=_type,
@@ -1047,6 +1060,8 @@ class Subscriber(BaseSubscriber):
             self.logger.debug("Failed to read message properties",
                               exc_info=True)
         try:
+            if self._compression != CompressionType.NO_COMPRESSION:
+                body = deflate(body)
             _data = self._serializer.deserialize(body)
         except Exception:
             self.logger.error("Could not deserialize data",
@@ -1098,8 +1113,17 @@ class Subscriber(BaseSubscriber):
 
 
 class PSubscriber(Subscriber):
+    """PSubscriber.
+    """
+
 
     def __init__(self, *args, **kwargs):
+        """__init__.
+
+        Args:
+            args:
+            kwargs:
+        """
         kwargs['topic'] = kwargs['topic'].replace('*', '#')
         super(PSubscriber, self).__init__(*args, **kwargs)
 
@@ -1120,6 +1144,8 @@ class PSubscriber(Subscriber):
                               exc_info=True)
 
         try:
+            if self._compression != CompressionType.NO_COMPRESSION:
+                body = deflate(body)
             _data = self._serializer.deserialize(body)
         except Exception:
             self.logger.error("Could not deserialize data",
