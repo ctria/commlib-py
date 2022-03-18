@@ -2,7 +2,7 @@ import datetime
 import functools
 import sys
 import time
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, Callable
 
 import redis
 
@@ -17,6 +17,7 @@ from commlib.msg import DataClass, DataField, Object, PubSubMessage, RPCMessage
 from commlib.pubsub import BasePublisher, BaseSubscriber
 from commlib.rpc import BaseRPCClient, BaseRPCService
 from commlib.serializer import Serializer, JSONSerializer
+from commlib.compression import CompressionType, inflate_str, deflate
 from commlib.utils import gen_timestamp
 
 
@@ -80,32 +81,55 @@ class UnixSocketConnectionParameters(ConnectionParametersBase):
 
 
 class ConnectionParameters(TCPConnectionParameters):
+    """ConnectionParameters.
+    """
+
     def __init__(self, *args, **kwargs):
+        """__init__.
+
+        Args:
+            args:
+            kwargs:
+        """
         super(ConnectionParameters, self).__init__(*args, **kwargs)
 
 
 class RedisConnection(redis.Redis):
+    """RedisConnection.
+    """
+
     def __init__(self, *args, **kwargs):
+        """__init__.
+
+        Args:
+            args:
+            kwargs:
+        """
         super(RedisConnection, self).__init__(*args, **kwargs)
 
 
 class RedisTransport(object):
+    """RedisTransport.
+    """
+
     def __init__(self,
                  conn_params: Any = None,
                  serializer: Serializer = JSONSerializer(),
+                 compression: CompressionType = CompressionType.DEFAULT_COMPRESSION,
                  logger: Any = None):
         """__init__.
 
         Args:
             conn_params (Any): conn_params
             serializer (Serializer): serializer
+            compression (CompressionType): compression
             logger (Any): logger
         """
         conn_params = TCPConnectionParameters() if \
             conn_params is None else conn_params
         self._conn_params = conn_params
-
         self._serializer = serializer
+        self._compression = compression
 
         self.logger = Logger(self.__class__.__name__) if \
             logger is None else logger
@@ -114,12 +138,16 @@ class RedisTransport(object):
             self.connect()
         except Exception as e:
             self.logger.error(
-                f'Failed to connect to Redis broker <{self._conn_params.host}' +
-                f'{self._conn_params.port}>')
+                f'Failed to connect to Redis <redis://' + \
+                f'{self._conn_params.host}:{self._conn_params.port}>')
             raise e
-        else:
-            self.logger.debug(
-                f'Connected to Redis <{self._conn_params.host}:{self._conn_params.port}>')
+        self.logger.debug('Redis Transport initiated:')
+        self.logger.debug(
+            f'- Broker: mqtt://' + \
+            f'{self._conn_params.host}:{self._conn_params.port}'
+        )
+        self.logger.debug(f'- Data Serialization: {self._serializer}')
+        self.logger.debug(f'- Data Compression: {self._compression}')
 
 
     def connect(self):
@@ -129,7 +157,7 @@ class RedisTransport(object):
                 username=self._conn_params.credentials.username,
                 password=self._conn_params.credentials.password,
                 db=self._conn_params.db,
-                decode_responses=True)
+                decode_responses=False)
         elif isinstance(self._conn_params, TCPConnectionParameters):
             self._redis = RedisConnection(
                 host=self._conn_params.host,
@@ -137,10 +165,9 @@ class RedisTransport(object):
                 username=self._conn_params.credentials.username,
                 password=self._conn_params.credentials.password,
                 db=self._conn_params.db,
-                decode_responses=True)
+                decode_responses=False)
 
         self._rsub = self._redis.pubsub()
-
 
     def delete_queue(self, queue_name: str) -> bool:
         # self.logger.debug('Removing message queue: <{}>'.format(queue_name))
@@ -151,22 +178,35 @@ class RedisTransport(object):
 
     def push_msg_to_queue(self, queue_name: str, data: Dict[str, Any]):
         payload = self._serializer.serialize(data)
+        if self._compression != CompressionType.NO_COMPRESSION:
+            payload = inflate_str(payload)
         self._redis.rpush(queue_name, payload)
 
     def publish(self, queue_name: str, data: Dict[str, Any]):
         payload = self._serializer.serialize(data)
+        if self._compression != CompressionType.NO_COMPRESSION:
+            payload = inflate_str(payload)
         self._redis.publish(queue_name, payload)
 
-    def subscribe(self, topic: str, callback: callable):
+    def subscribe(self, topic: str, callback: Callable):
+        _clb = functools.partial(self._on_msg_internal, callback)
         self._sub = self._rsub.psubscribe(
-            **{topic: callback})
+            **{topic: _clb})
         self._rsub.get_message()
         t = self._rsub.run_in_thread(0.001, daemon=True)
         return t
 
+    def _on_msg_internal(self, callback: Callable, data: Any):
+        if self._compression != CompressionType.NO_COMPRESSION:
+            # _topic = data['channel']
+            data['data'] = deflate(data['data'])
+        callback(data)
+
     def wait_for_msg(self, queue_name: str, timeout=10):
         try:
             msgq, payload = self._redis.blpop(queue_name, timeout=timeout)
+            if self._compression != CompressionType.NO_COMPRESSION:
+                payload = deflate(payload)
         except Exception as exc:
             self.logger.error(exc, exc_info=True)
             msgq = ''
@@ -191,6 +231,8 @@ class RPCService(BaseRPCService):
         """
         super(RPCService, self).__init__(*args, **kwargs)
         self._transport = RedisTransport(conn_params=conn_params,
+                                         serializer=self._serializer,
+                                         compression=self._compression,
                                          logger=self._logger)
 
     def _send_response(self, data, reply_to):
@@ -251,11 +293,23 @@ class RPCService(BaseRPCService):
 
 
 class RPCClient(BaseRPCClient):
+    """RPCClient.
+    """
+
     def __init__(self,
                  conn_params: ConnectionParameters = None,
                  *args, **kwargs):
+        """__init__.
+
+        Args:
+            conn_params (ConnectionParameters): conn_params
+            args:
+            kwargs:
+        """
         super(RPCClient, self).__init__(*args, **kwargs)
         self._transport = RedisTransport(conn_params=conn_params,
+                                         serializer=self._serializer,
+                                         compression=self._compression,
                                          logger=self._logger)
 
     def _gen_queue_name(self):
@@ -319,6 +373,8 @@ class Publisher(BasePublisher):
         super(Publisher, self).__init__(*args, **kwargs)
 
         self._transport = RedisTransport(conn_params=conn_params,
+                                         serializer=self._serializer,
+                                         compression=self._compression,
                                          logger=self._logger)
 
     def publish(self, msg: PubSubMessage) -> None:
@@ -402,6 +458,8 @@ class Subscriber(BaseSubscriber):
         super(Subscriber, self).__init__(*args, **kwargs)
 
         self._transport = RedisTransport(conn_params=conn_params,
+                                         serializer=self._serializer,
+                                         compression=self._compression,
                                          logger=self._logger)
 
     def run(self):
