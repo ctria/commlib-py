@@ -252,6 +252,9 @@ class Node:
         self._logger = Logger(self._node_name, debug=debug)
         self._logger.info(f'Created Node <{self._node_name}>')
 
+    def __del__(self):
+        self.stop()
+
     def init_heartbeat_thread(self, topic: str = None) -> None:
         """init_heartbeat_thread.
         Starts the heartbeat thread. Heartbeat messages are sent periodically
