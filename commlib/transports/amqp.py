@@ -671,9 +671,11 @@ class RPCService(BaseRPCService):
 
     def __del__(self):
         self.close()
+        self._transport.disconnect()
 
     def __exit__(self, exc_type, value, traceback):
         self.close()
+        self._transport.disconnect()
 
 
 class RPCClient(BaseRPCClient):
@@ -1092,9 +1094,11 @@ class Subscriber(BaseSubscriber):
 
     def __del__(self):
         self.close()
+        self._transport._client.disconnect()
 
     def __exit__(self, exc_type, value, traceback):
         self.close()
+        self._transport._client.disconnect()
 
 
 class PSubscriber(Subscriber):
